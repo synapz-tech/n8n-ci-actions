@@ -1,0 +1,146 @@
+name: n8n Sync (reusable)
+
+# Reusable workflow that any consumer repo can call to validate and deploy
+# its n8n workflow JSONs to a target n8n instance.
+#
+# Consumer example (in <owner>/<your-n8n-repo>/.github/workflows/n8n-sync.yml):
+#
+#   name: n8n Sync
+#   on:
+#     push:
+#       branches: [main]
+#       paths:
+#         - "**/*.json"
+#         - ".github/workflows/n8n-sync.yml"
+#     pull_request:
+#       paths:
+#         - "**/*.json"
+#         - ".github/workflows/n8n-sync.yml"
+#     workflow_dispatch:
+#       inputs:
+#         dry_run:
+#           description: "Dry run (do not write to n8n)"
+#           type: boolean
+#           default: false
+#
+#   jobs:
+#     sync:
+#       uses: synapz-tech/n8n-ci-actions/.github/workflows/n8n-sync.yml@v1
+#       with:
+#         required-tags: "<your-domain-tag>,Git Source of Truth"
+#         dry-run: ${{ github.event.inputs.dry_run == 'true' }}
+#       secrets: inherit
+#
+# The consumer must expose the following secrets/variables:
+#   - vars.N8N_API_URL        e.g. https://n8n.example.com
+#   - secrets.N8N_API_KEY     long-lived n8n Public API key
+
+on:
+  workflow_call:
+    inputs:
+      required-tags:
+        description: |
+          Comma-separated list of tag names every workflow JSON must carry, e.g.
+          "MyTag,Git Source of Truth". Both validate and deploy use this to
+          enforce the convention.
+        required: false
+        type: string
+        default: "Git Source of Truth"
+      ref:
+        description: |
+          Git ref of this repo to checkout for the tooling. Pin to a tag for
+          stability. Defaults to "v1".
+        required: false
+        type: string
+        default: "v1"
+      python-version:
+        description: "Python version used by the runner."
+        required: false
+        type: string
+        default: "3.11"
+      dry-run:
+        description: |
+          When true, the deploy job runs `--dry-run` and does not write to the
+          n8n instance. Useful when invoked via workflow_dispatch for safety.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate workflow JSONs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repo
+        uses: actions/checkout@v4
+
+      - name: Checkout tooling (this repo)
+        uses: actions/checkout@v4
+        with:
+          repository: synapz-tech/n8n-ci-actions
+          ref: ${{ inputs.ref }}
+          path: .n8n-ci-actions
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Validate all workflow JSONs
+        env:
+          N8N_REQUIRED_TAGS: ${{ inputs.required-tags }}
+          # Scan the consumer repo's working dir, not the tooling checkout
+          N8N_WORKFLOWS_ROOT: ${{ github.workspace }}
+        run: python .n8n-ci-actions/scripts/n8n/validate_workflow.py --all
+
+  deploy:
+    name: Deploy workflows to n8n
+    needs: validate
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repo
+        uses: actions/checkout@v4
+
+      - name: Checkout tooling (this repo)
+        uses: actions/checkout@v4
+        with:
+          repository: synapz-tech/n8n-ci-actions
+          ref: ${{ inputs.ref }}
+          path: .n8n-ci-actions
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Check required configuration
+        env:
+          N8N_API_URL: ${{ vars.N8N_API_URL }}
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+        run: |
+          if [ -z "$N8N_API_URL" ]; then
+            echo "::error::Variable N8N_API_URL is not set for this repo or its org."
+            exit 1
+          fi
+          if [ -z "$N8N_API_KEY" ]; then
+            echo "::error::Secret N8N_API_KEY is not set for this repo or its org."
+            exit 1
+          fi
+          echo "Target n8n instance: $N8N_API_URL"
+
+      - name: Deploy workflows
+        env:
+          N8N_API_URL: ${{ vars.N8N_API_URL }}
+          N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+          N8N_REQUIRED_TAGS: ${{ inputs.required-tags }}
+          N8N_WORKFLOWS_ROOT: ${{ github.workspace }}
+        run: |
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            python .n8n-ci-actions/scripts/n8n/deploy_workflow.py --all --dry-run
+          else
+            python .n8n-ci-actions/scripts/n8n/deploy_workflow.py --all
+          fi
