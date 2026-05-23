@@ -16,7 +16,8 @@ Exit code: 0 on success, 1 on validation errors.
 Checks performed (see AGENTS.md root for the rationale):
     1. JSON is parseable.
     2. Required top-level keys exist: name, nodes, connections, active, settings.
-    3. `active` must be False (activation is controlled inside n8n, not in Git).
+    3. `active` must be a boolean (true/false). The value is the desired runtime state in n8n:
+       the deploy script applies it via the dedicated activate/deactivate endpoints.
     4. `pinData` must be empty/missing (no test fixtures committed).
     5. Tags must contain every entry of N8N_REQUIRED_TAGS.
     6. There must be at least one sticky note named 'Git Source of Truth - Editing Notice'.
@@ -92,9 +93,13 @@ def validate_file(path: Path) -> list[str]:
         if key not in data:
             errors.append(f"missing required top-level key: '{key}'")
 
-    # 2. active must be false
-    if data.get("active") is not False:
-        errors.append(f"`active` must be false in Git (got: {data.get('active')!r})")
+    # 2. active must be a boolean. The value (true/false) is the desired runtime
+    # state — the deploy script reads it and calls /activate or /deactivate to
+    # reconcile the live workflow with what is committed in Git.
+    if not isinstance(data.get("active"), bool):
+        errors.append(
+            f"`active` must be a boolean (true or false), got: {data.get('active')!r}"
+        )
 
     # 3. pinData must be empty
     pin = data.get("pinData")

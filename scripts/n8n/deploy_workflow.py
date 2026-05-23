@@ -11,6 +11,7 @@ Usage:
     python scripts/n8n/deploy_workflow.py --dry-run --all
 
 Configuration via environment variables:
+Configuration via environment variables:
     N8N_API_URL              (required) base URL of the n8n instance
     N8N_API_KEY              (required) long-lived Public API key
     N8N_REQUIRED_TAGS        (optional) comma-separated tags ensured on every workflow.
@@ -24,6 +25,10 @@ Configuration via environment variables:
                              (create). This prevents duplicate creation when the id in the
                              JSON drifts (e.g. workflow was recreated manually on n8n). Set
                              to "0" to restore the legacy "always create on id miss" behavior.
+    N8N_DEPLOY_ACTIVE        (optional) "1" (default) or "0". When "1", the deploy reconciles
+                             the workflow's runtime `active` state against the value committed
+                             in the JSON. Set to "0" to skip the activate/deactivate step
+                             (matches the historical behavior of leaving runtime state untouched).
 
 Behavior:
     - For each workflow, look it up on n8n by `id` (from the JSON).
@@ -38,8 +43,11 @@ Behavior:
       POST /api/v1/workflows to create.
     - After upsert: ensure tags listed in N8N_REQUIRED_TAGS are applied via
       PUT /api/v1/workflows/{id}/tags (creating any tag that doesn't exist yet).
-    - We never activate a workflow. The Git source has `active: false` by design; activation
-      is a manual operator action inside n8n.
+    - After tags: reconcile the runtime `active` state against the value committed in
+      the JSON. If `active: true` -> POST /api/v1/workflows/{id}/activate. If
+      `active: false` -> POST /api/v1/workflows/{id}/deactivate. Both endpoints are
+      idempotent on n8n (calling activate on an already-active workflow returns 200).
+      Set N8N_DEPLOY_ACTIVE=0 to disable this step (legacy "never touch active" behavior).
     - We never set `parentFolderId` (folder placement) — that requires the internal /rest API
       with a browser session cookie, not the Public API key. Folder placement stays manual
       on first creation; updates preserve it because we don't touch it.
@@ -48,6 +56,7 @@ Notes about the n8n Public API quirks (handled below):
     - The PUT/POST body must NOT include extra fields. Allowed: name, nodes, connections, settings, staticData.
     - The body must NOT include `id` (we use the path parameter for PUT).
     - The response uses 200 for PUT and 200/201 for POST.
+    - The activate/deactivate endpoints take no body and respond 200.
 """
 from __future__ import annotations
 
@@ -77,6 +86,14 @@ def _reconcile_by_name_enabled() -> bool:
 
 
 RECONCILE_BY_NAME = _reconcile_by_name_enabled()
+
+
+def _deploy_active_enabled() -> bool:
+    """Default: reconcile runtime active state against JSON. Set N8N_DEPLOY_ACTIVE=0 to skip."""
+    return os.environ.get("N8N_DEPLOY_ACTIVE", "1").strip() not in {"0", "false", "False", ""}
+
+
+DEPLOY_ACTIVE = _deploy_active_enabled()
 
 EXCLUDED_DIRS = {".git", ".github", ".kilo", "scripts", "node_modules"}
 
@@ -280,7 +297,11 @@ def deploy_workflow(
         url = f"{api_url}/api/v1/workflows"
 
     if dry_run:
-        print(f"DRY-RUN {action:60} {rel}  [{len(body.get('nodes', []))} nodes]")
+        active_info = ""
+        if DEPLOY_ACTIVE:
+            verb = "activate" if bool(wf.get("active", False)) else "deactivate"
+            active_info = f" [will {verb}]"
+        print(f"DRY-RUN {action:60} {rel}  [{len(body.get('nodes', []))} nodes]{active_info}")
         return "dry-run"
 
     status, response = http(method, url, api_key, body)
@@ -302,7 +323,24 @@ def deploy_workflow(
     if status != 200:
         raise DeployError(f"{rel}: failed to set tags: {status} {response!r}")
 
-    print(f"OK      {action:60} {rel}  (tags: {desired_tag_names})")
+    # Reconcile runtime active state with what is committed in Git.
+    # n8n's Public API exposes dedicated /activate and /deactivate endpoints; the PUT
+    # body cannot include `active`. Both endpoints are idempotent (calling activate
+    # on an already-active workflow returns 200). Opt-out via N8N_DEPLOY_ACTIVE=0.
+    active_suffix = ""
+    if DEPLOY_ACTIVE:
+        desired_active = bool(wf.get("active", False))
+        verb = "activate" if desired_active else "deactivate"
+        status, response = http(
+            "POST", f"{api_url}/api/v1/workflows/{result_id}/{verb}", api_key
+        )
+        if status not in (200, 201):
+            raise DeployError(
+                f"{rel}: failed to {verb} workflow {result_id}: {status} {response!r}"
+            )
+        active_suffix = f" [{verb}d]"
+
+    print(f"OK      {action:60} {rel}  (tags: {desired_tag_names}){active_suffix}")
     return result_id
 
 
