@@ -28,8 +28,14 @@ Designed to be consumed by multiple `n8n-*` repositories that hold n8n workflow 
 For each workflow JSON:
 - Look up on n8n by `id`
 - Exists → `PUT /api/v1/workflows/{id}` (update)
-- Doesn't exist → `POST /api/v1/workflows` (create)
+- Doesn't exist and reconciliation is enabled (default) → look up by `name`:
+  - Exactly 1 match → `PUT` to that id (and print a warning suggesting you update the JSON's `id` field)
+  - 2+ matches → fail with an actionable error listing the duplicate ids; operator must delete or rename the duplicates on n8n before re-running
+  - 0 matches → `POST` to create
+- Doesn't exist and reconciliation disabled (`N8N_RECONCILE_BY_NAME=0`) → `POST /api/v1/workflows` (legacy behavior)
 - After upsert: ensure tags via `PUT /api/v1/workflows/{id}/tags` (creating any missing tag)
+
+> Name-based reconciliation prevents the deploy from silently creating duplicates every time someone recreates a workflow on n8n with a new id (which is the only way to recover from many manual-edit scenarios). It is enabled by default — set `N8N_RECONCILE_BY_NAME=0` to opt out.
 
 Never activates a workflow. Never sets `parentFolderId` (the Public API does not expose folder placement — folder is a one-time manual setup; updates preserve it).
 
@@ -78,6 +84,12 @@ Set at the organization level (recommended) or per repo:
 - **Secret** `N8N_API_KEY` — long-lived n8n Public API key (n8n UI → Settings → n8n API → Create API Key)
 
 For private consumer repos, the organization plan must be GitHub Team or higher for org-level secrets to be readable by them.
+
+### Optional environment variables
+
+These can be set on the runner (e.g. via `env:` in your reusable workflow override) when the defaults do not fit:
+
+- `N8N_RECONCILE_BY_NAME` — `1` (default) or `0`. When `1`, the deploy script falls back to looking up workflows by `name` if the JSON `id` does not exist on the server, preventing duplicate creation when ids drift. Set to `0` to restore the legacy "create on id miss" behavior.
 
 ## Inputs
 

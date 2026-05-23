@@ -11,19 +11,31 @@ Usage:
     python scripts/n8n/deploy_workflow.py --dry-run --all
 
 Configuration via environment variables:
-    N8N_API_URL          (required) base URL of the n8n instance
-    N8N_API_KEY          (required) long-lived Public API key
-    N8N_REQUIRED_TAGS    (optional) comma-separated tags ensured on every workflow.
-                         Defaults to "Git Source of Truth" only.
-    N8N_WORKFLOWS_ROOT   (optional) directory to scan when --all is given. Defaults to
-                         the repo root inferred from this script's path. Override when
-                         running from another repo (e.g. via a reusable GitHub Action).
+    N8N_API_URL              (required) base URL of the n8n instance
+    N8N_API_KEY              (required) long-lived Public API key
+    N8N_REQUIRED_TAGS        (optional) comma-separated tags ensured on every workflow.
+                             Defaults to "Git Source of Truth" only.
+    N8N_WORKFLOWS_ROOT       (optional) directory to scan when --all is given. Defaults to
+                             the repo root inferred from this script's path. Override when
+                             running from another repo (e.g. via a reusable GitHub Action).
+    N8N_RECONCILE_BY_NAME    (optional) "1" (default) or "0". When "1" and the workflow id
+                             from the JSON does not exist on the server, the script looks
+                             up an existing workflow by `name` before falling back to POST
+                             (create). This prevents duplicate creation when the id in the
+                             JSON drifts (e.g. workflow was recreated manually on n8n). Set
+                             to "0" to restore the legacy "always create on id miss" behavior.
 
 Behavior:
     - For each workflow, look it up on n8n by `id` (from the JSON).
     - If found: PUT /api/v1/workflows/{id} with `name`, `nodes`, `connections`, `settings`,
       `staticData`. (Public API does NOT accept `active`, `tags`, `pinData` in the body.)
-    - If not found: POST /api/v1/workflows with the same body to create.
+    - If not found and N8N_RECONCILE_BY_NAME != "0": look up an existing workflow whose
+      `name` matches the JSON's `name`. If exactly one match exists, PUT to that id and
+      print a warning suggesting the consumer update the JSON's `id` field to match.
+      If two or more matches exist, fail with an actionable error (the operator must
+      delete the duplicates or rename them before the deploy can proceed).
+    - If not found and either reconciliation is disabled or there is no name match:
+      POST /api/v1/workflows to create.
     - After upsert: ensure tags listed in N8N_REQUIRED_TAGS are applied via
       PUT /api/v1/workflows/{id}/tags (creating any tag that doesn't exist yet).
     - We never activate a workflow. The Git source has `active: false` by design; activation
@@ -57,6 +69,14 @@ def _required_tags_from_env() -> list[str]:
 
 
 REQUIRED_TAGS = _required_tags_from_env()
+
+
+def _reconcile_by_name_enabled() -> bool:
+    """Default: reconcile by name when id misses. Set N8N_RECONCILE_BY_NAME=0 to disable."""
+    return os.environ.get("N8N_RECONCILE_BY_NAME", "1").strip() not in {"0", "false", "False", ""}
+
+
+RECONCILE_BY_NAME = _reconcile_by_name_enabled()
 
 EXCLUDED_DIRS = {".git", ".github", ".kilo", "scripts", "node_modules"}
 
@@ -138,6 +158,34 @@ def workflow_exists(api_url: str, api_key: str, wf_id: str) -> bool:
     return status == 200
 
 
+def find_workflow_ids_by_name(api_url: str, api_key: str, name: str) -> list[str]:
+    """Return the ids of every workflow whose `name` equals `name` exactly.
+
+    Paginates through /api/v1/workflows because the Public API caps `limit` at 250
+    and consumers can have hundreds of workflows on the same instance.
+    """
+    matches: list[str] = []
+    cursor: str | None = None
+    page = 0
+    # Safety: cap pagination depth to avoid runaway loops on misbehaving servers.
+    max_pages = 50
+    while page < max_pages:
+        url = f"{api_url}/api/v1/workflows?limit=250"
+        if cursor:
+            url += f"&cursor={cursor}"
+        status, body = http("GET", url, api_key)
+        if status != 200 or not isinstance(body, dict):
+            raise DeployError(f"GET /api/v1/workflows failed during name lookup: {status} {body!r}")
+        for wf in body.get("data") or []:
+            if isinstance(wf, dict) and wf.get("name") == name and wf.get("id"):
+                matches.append(wf["id"])
+        cursor = body.get("nextCursor")
+        if not cursor:
+            break
+        page += 1
+    return matches
+
+
 def fetch_tag_id_map(api_url: str, api_key: str) -> dict[str, str]:
     """Return {tag_name: tag_id} for all tags in the instance."""
     status, body = http("GET", f"{api_url}/api/v1/tags?limit=250", api_key)
@@ -183,28 +231,63 @@ def deploy_workflow(
 ) -> str:
     wf = load_workflow(wf_path)
     wf_id = wf.get("id")
+    wf_name = wf.get("name")
     body = build_body(wf)
 
     rel = wf_path.relative_to(REPO_ROOT) if REPO_ROOT in wf_path.parents else wf_path
 
+    target_id: str | None = None
+    method: str
+    action: str
+
     if wf_id and workflow_exists(api_url, api_key, wf_id):
+        # Happy path: id from JSON matches an existing workflow.
+        target_id = wf_id
         action = f"UPDATE {wf_id}"
-        url = f"{api_url}/api/v1/workflows/{wf_id}"
         method = "PUT"
+    elif RECONCILE_BY_NAME and wf_name:
+        # The JSON id is missing or stale. Look up by name to avoid creating duplicates
+        # every time someone recreates the workflow on n8n with a fresh id.
+        matches = find_workflow_ids_by_name(api_url, api_key, wf_name)
+        if len(matches) == 1:
+            target_id = matches[0]
+            action = f"RECONCILE {target_id} (json id {wf_id!r} stale; matched by name)"
+            method = "PUT"
+            print(
+                f"WARN    {rel}: workflow id {wf_id!r} not found; reconciling by name to "
+                f"{target_id!r}. Update the JSON's `id` field to {target_id!r} to silence "
+                f"this warning."
+            )
+        elif len(matches) >= 2:
+            raise DeployError(
+                f"{rel}: cannot reconcile workflow by name {wf_name!r}: "
+                f"{len(matches)} duplicates found on the server ({matches}). "
+                f"Delete or rename the duplicates on n8n, then re-run the deploy. "
+                f"Set N8N_RECONCILE_BY_NAME=0 to disable name-based reconciliation."
+            )
+        else:
+            # No id match, no name match: create.
+            action = "CREATE" if not wf_id else f"CREATE (id {wf_id} not found, no name match)"
+            method = "POST"
     else:
+        # Reconciliation disabled or workflow has no name: legacy behavior (POST).
         action = "CREATE" if not wf_id else f"CREATE (id {wf_id} not found)"
-        url = f"{api_url}/api/v1/workflows"
         method = "POST"
 
+    if method == "PUT" and target_id:
+        url = f"{api_url}/api/v1/workflows/{target_id}"
+    else:
+        url = f"{api_url}/api/v1/workflows"
+
     if dry_run:
-        print(f"DRY-RUN {action:30} {rel}  [{len(body.get('nodes', []))} nodes]")
+        print(f"DRY-RUN {action:60} {rel}  [{len(body.get('nodes', []))} nodes]")
         return "dry-run"
 
     status, response = http(method, url, api_key, body)
     if status not in (200, 201) or not isinstance(response, dict):
         raise DeployError(f"{rel}: {method} {url} -> {status} {response!r}")
 
-    result_id = response.get("id") or wf_id
+    result_id = response.get("id") or target_id or wf_id
     if not result_id:
         raise DeployError(f"{rel}: response missing workflow id: {response!r}")
 
@@ -219,7 +302,7 @@ def deploy_workflow(
     if status != 200:
         raise DeployError(f"{rel}: failed to set tags: {status} {response!r}")
 
-    print(f"OK      {action:30} {rel}  (tags: {desired_tag_names})")
+    print(f"OK      {action:60} {rel}  (tags: {desired_tag_names})")
     return result_id
 
 
