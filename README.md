@@ -15,7 +15,7 @@ Designed to be consumed by multiple `n8n-*` repositories that hold n8n workflow 
 
 1. JSON parseable
 2. Required top-level keys present (`name`, `nodes`, `connections`, `active`, `settings`)
-3. `active: false` (activation is operator action, not Git)
+3. `active` is a boolean (true or false). The value reflects the desired runtime state in n8n; the deploy script reconciles it via the activate/deactivate endpoints.
 4. `pinData` empty (no fixtures committed)
 5. Every tag listed in `required-tags` present on the workflow
 6. Sticky Note named `Git Source of Truth - Editing Notice` present in the canvas
@@ -34,10 +34,13 @@ For each workflow JSON:
   - 0 matches → `POST` to create
 - Doesn't exist and reconciliation disabled (`N8N_RECONCILE_BY_NAME=0`) → `POST /api/v1/workflows` (legacy behavior)
 - After upsert: ensure tags via `PUT /api/v1/workflows/{id}/tags` (creating any missing tag)
+- After tags: reconcile runtime state. `active: true` in the JSON → `POST /api/v1/workflows/{id}/activate`. `active: false` → `POST /api/v1/workflows/{id}/deactivate`. Both endpoints are idempotent. Opt out with `N8N_DEPLOY_ACTIVE=0`.
 
 > Name-based reconciliation prevents the deploy from silently creating duplicates every time someone recreates a workflow on n8n with a new id (which is the only way to recover from many manual-edit scenarios). It is enabled by default — set `N8N_RECONCILE_BY_NAME=0` to opt out.
 
-Never activates a workflow. Never sets `parentFolderId` (the Public API does not expose folder placement — folder is a one-time manual setup; updates preserve it).
+The JSON's `active` field is treated as desired state — Git becomes the source of truth for runtime state too, not just structure. Operators can still toggle from the n8n UI, but the next deploy will reconcile back to the committed value.
+
+Never sets `parentFolderId` (folder placement) — the Public API does not expose it. Folder is a one-time manual setup; updates preserve it.
 
 Settings keys not in the Public API allowlist are silently dropped before PUT/POST (the n8n Public API rejects unknown keys with `"request/body/settings must NOT have additional properties"`).
 
@@ -87,9 +90,10 @@ For private consumer repos, the organization plan must be GitHub Team or higher 
 
 ### Optional environment variables
 
-These can be set on the runner (e.g. via `env:` in your reusable workflow override) when the defaults do not fit:
+These can be overridden on the runner (e.g. via `env:` in the consumer reusable workflow override) when the defaults do not fit:
 
 - `N8N_RECONCILE_BY_NAME` — `1` (default) or `0`. When `1`, the deploy script falls back to looking up workflows by `name` if the JSON `id` does not exist on the server, preventing duplicate creation when ids drift. Set to `0` to restore the legacy "create on id miss" behavior.
+- `N8N_DEPLOY_ACTIVE` — `1` (default) or `0`. When `1`, the deploy reconciles each workflow's runtime active state against the value committed in its JSON (`active: true` → `/activate`; `active: false` → `/deactivate`). Set to `0` to skip this step entirely and leave runtime state untouched (matches the historical behavior).
 
 ## Inputs
 

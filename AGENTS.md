@@ -70,7 +70,7 @@ In `validate_workflow.py`:
 
 In `deploy_workflow.py`:
 
-1. Verify the operation exists in the **Public API** (`/api/v1/*`). Operations available only via `/rest` (folder placement, activation, etc.) stay out of scope here.
+1. Verify the operation exists in the **Public API** (`/api/v1/*`). Operations available only via `/rest` (folder placement, project assignment, etc.) stay out of scope here. Activation and deactivation **are** available on the Public API (`POST /api/v1/workflows/{id}/activate` and `/deactivate`) and are reconciled by the deploy script against the `active` field of each JSON.
 2. Filter the payload to only send fields the API accepts (see `ALLOWED_BODY_KEYS`, `ALLOWED_SETTINGS_KEYS`)
 3. Handle idempotency: re-running the deploy should not produce different side effects
 4. Document the behavior in `README.md`
