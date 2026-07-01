@@ -4,7 +4,7 @@
 <br />
 <div align="center">
   <a href="https://synapz.tech">
-    <img src="https://raw.githubusercontent.com/synapz-tech/chat/main/main/branding/favicon-96x96.png" alt="Synapz" width="80" height="80">
+    <img src="main/branding/favicon-96x96.png" alt="Synapz" width="80" height="80">
   </a>
 
   <h3 align="center">n8n CI Actions</h3>
